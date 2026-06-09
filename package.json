@@ -1,0 +1,14 @@
+{
+  "name": "codex-mobile-companion",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "node scripts/start.mjs",
+    "relay": "node server/relay.mjs",
+    "host": "node host/host-agent.mjs",
+    "check": "node scripts/check.mjs"
+  },
+  "dependencies": {},
+  "devDependencies": {}
+}

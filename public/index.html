@@ -1,0 +1,52 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="theme-color" content="#111827">
+    <title>Codex Mobile Companion</title>
+    <link rel="manifest" href="/manifest.json">
+    <link rel="stylesheet" href="/styles.css">
+  </head>
+  <body>
+    <main class="app-shell">
+      <header class="topbar">
+        <div>
+          <h1>Codex Companion</h1>
+          <p id="statusLine">连接中</p>
+        </div>
+        <button id="refreshButton" class="icon-button" title="刷新" aria-label="刷新">↻</button>
+      </header>
+
+      <section class="composer">
+        <textarea id="messageInput" rows="3" placeholder="发给 Codex 的消息"></textarea>
+        <button id="sendButton">发送</button>
+      </section>
+
+      <nav class="tabs" aria-label="视图">
+        <button class="tab active" data-view="projects">项目</button>
+        <button class="tab" data-view="timeline">消息</button>
+        <button class="tab" data-view="history">历史</button>
+        <button class="tab" data-view="approvals">授权 <span id="approvalBadge">0</span></button>
+      </nav>
+
+      <section id="projectsView" class="view active">
+        <div id="projects" class="stack"></div>
+      </section>
+
+      <section id="timelineView" class="view">
+        <div id="timeline" class="timeline"></div>
+      </section>
+
+      <section id="historyView" class="view">
+        <div id="historyThreads" class="stack"></div>
+      </section>
+
+      <section id="approvalsView" class="view">
+        <div id="approvals" class="stack"></div>
+      </section>
+    </main>
+
+    <script type="module" src="/app.js"></script>
+  </body>
+</html>
