@@ -449,9 +449,10 @@ function renderTimeline() {
     return;
   }
 
-  els.timeline.innerHTML = buildTimelineEntries(currentEvents).slice(-120).map(renderEvent).join("");
+  const currentEntries = buildTimelineEntries(currentEvents).slice(-120).reverse();
+  els.timeline.innerHTML = currentEntries.map(renderEvent).join("");
   requestAnimationFrame(() => {
-    window.scrollTo({ top: document.body.scrollHeight, behavior: "smooth" });
+    window.scrollTo({ top: 0, behavior: "auto" });
   });
 }
 
