@@ -3,12 +3,31 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
+  "bin": {
+    "codex-mobile-companion": "./cli.mjs"
+  },
+  "files": [
+    "cli.mjs",
+    "host",
+    "public",
+    "scripts",
+    "server",
+    "README.md",
+    "package.json",
+    "package-lock.json"
+  ],
   "scripts": {
     "start": "node scripts/start.mjs",
     "relay": "node server/relay.mjs",
     "host": "node host/host-agent.mjs",
-    "check": "node scripts/check.mjs"
+    "check": "node scripts/check.mjs",
+    "test": "node scripts/smoke.mjs"
   },
-  "dependencies": {},
+  "engines": {
+    "node": ">=22"
+  },
+  "dependencies": {
+    "@anthropic-ai/claude-agent-sdk": "latest"
+  },
   "devDependencies": {}
 }

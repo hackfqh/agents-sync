@@ -1,9 +1,14 @@
 import { randomUUID } from "node:crypto";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 
 const relayBaseUrl = normalizeRelayBase(process.env.RELAY_URL || "http://localhost:8787");
 const codexWsUrl = withCodexAuthToken(process.env.CODEX_WS_URL || "ws://localhost:7331");
 const sharedToken = process.env.MOBILE_COMPANION_TOKEN || "dev-token";
 const workdir = process.env.WORKDIR || process.cwd();
+const codexAgent = "codex";
+const claudeAgent = "claude";
 
 let codex = null;
 let codexReady = false;
@@ -11,11 +16,27 @@ let codexRequestId = 1;
 let relayCommandSeq = 0;
 let activeThreadId = null;
 let activeTurnId = null;
+let claudeSdkPromise = null;
 
 const pendingCodexRequests = new Map();
 const pendingApprovals = new Map();
 const activeTurnsByThread = new Map();
+const activeClaudeTurns = new Map();
 const resumedThreads = new Set();
+const agentAdapters = {
+  [codexAgent]: {
+    startTurn: startOrContinueTurn,
+    listProjects: listHistoryProjects,
+    listThreads: listHistoryThreads,
+    readThread: readHistoryThread
+  },
+  [claudeAgent]: {
+    startTurn: startOrContinueClaudeTurn,
+    listProjects: listClaudeProjects,
+    listThreads: listClaudeThreads,
+    readThread: readClaudeThread
+  }
+};
 
 if (typeof WebSocket !== "function") {
   throw new Error("Node.js 22+ is required because this host agent uses the built-in WebSocket client.");
@@ -107,32 +128,35 @@ async function handleRelayRequest(message) {
   if (!message.id || !message.type) return;
 
   try {
+    const payload = message.payload || {};
+    const adapter = agentAdapterFor(payload.agent);
+
     if (message.type === "user.message") {
-      const result = await startOrContinueTurn(message.payload || {});
+      const result = await adapter.startTurn(payload);
       await replyToRelay(message.id, { ok: true, result });
       return;
     }
 
     if (message.type === "approval.answer") {
-      const result = answerApproval(message.payload || {});
+      const result = answerApproval(payload);
       await replyToRelay(message.id, { ok: true, result });
       return;
     }
 
     if (message.type === "history.projects") {
-      const result = await listHistoryProjects(message.payload || {});
+      const result = await adapter.listProjects(payload);
       await replyToRelay(message.id, { ok: true, result });
       return;
     }
 
     if (message.type === "history.threads") {
-      const result = await listHistoryThreads(message.payload || {});
+      const result = await adapter.listThreads(payload);
       await replyToRelay(message.id, { ok: true, result });
       return;
     }
 
     if (message.type === "history.thread.read") {
-      const result = await readHistoryThread(message.payload || {});
+      const result = await adapter.readThread(payload);
       await replyToRelay(message.id, { ok: true, result });
       return;
     }
@@ -166,6 +190,7 @@ async function startOrContinueTurn(payload) {
     activeThreadId = threadId;
 
     await sendThreadUpsert({
+      agent: codexAgent,
       threadId,
       title: firstLine(text),
       status: thread.status || "running",
@@ -202,6 +227,7 @@ async function startOrContinueTurn(payload) {
   }
 
   await sendRelayEvent({
+    agent: codexAgent,
     type: "user.message",
     threadId,
     turnId,
@@ -218,6 +244,14 @@ function answerApproval(payload) {
   }
 
   pendingApprovals.delete(payload.approvalId);
+
+  if (pending.agent === claudeAgent) {
+    pending.resolve(mapClaudeApprovalDecision(payload.decision, pending.toolUseID));
+    return {
+      approvalId: payload.approvalId,
+      decision: payload.decision
+    };
+  }
 
   const result = mapDecision(payload.decision);
   codex.send(JSON.stringify({
@@ -347,6 +381,418 @@ async function readHistoryThread(payload) {
   };
 }
 
+async function startOrContinueClaudeTurn(payload) {
+  const text = payload.text.trim();
+  const selectedCwd = payload.cwd || workdir;
+  const sessionId = payload.threadId || randomUUID();
+  const turnId = randomUUID();
+  const isResume = Boolean(payload.threadId);
+
+  activeClaudeTurns.set(sessionId, turnId);
+
+  await sendThreadUpsert({
+    agent: claudeAgent,
+    threadId: sessionId,
+    title: firstLine(text),
+    status: "running",
+    cwd: selectedCwd,
+    preview: firstLine(text)
+  });
+
+  await sendRelayEvent({
+    agent: claudeAgent,
+    type: "user.message",
+    threadId: sessionId,
+    turnId,
+    itemId: `user-${turnId}`,
+    text
+  });
+
+  fireAndForget(runClaudeTurn({
+    text,
+    cwd: selectedCwd,
+    sessionId,
+    turnId,
+    isResume
+  }));
+
+  return { threadId: sessionId, turnId };
+}
+
+async function runClaudeTurn({ text, cwd, sessionId, turnId, isResume }) {
+  let completed = false;
+  let failed = false;
+
+  try {
+    const { query } = await loadClaudeSdk();
+    const claudeExecutable = resolveClaudeCodeExecutable();
+    const options = {
+      cwd,
+      permissionMode: process.env.CLAUDE_PERMISSION_MODE || "default",
+      systemPrompt: {
+        type: "preset",
+        preset: "claude_code"
+      },
+      tools: {
+        type: "preset",
+        preset: "claude_code"
+      },
+      settingSources: ["user", "project", "local"],
+      env: {
+        ...process.env,
+        CLAUDE_AGENT_SDK_CLIENT_APP: "codex-mobile-companion"
+      },
+      canUseTool: createClaudeApprovalHandler({ sessionId, turnId, cwd })
+    };
+
+    if (claudeExecutable) {
+      options.pathToClaudeCodeExecutable = claudeExecutable;
+    }
+
+    if (isResume) {
+      options.resume = sessionId;
+    } else {
+      options.sessionId = sessionId;
+    }
+
+    for await (const message of query({ prompt: text, options })) {
+      if (await handleClaudeSdkMessage(message, { sessionId, turnId, cwd })) {
+        completed = true;
+      }
+    }
+  } catch (error) {
+    failed = true;
+    await sendRelayEvent({
+      agent: claudeAgent,
+      type: "assistant.delta",
+      threadId: sessionId,
+      turnId,
+      itemId: `error-${turnId}`,
+      text: `Claude 运行失败：${formatClaudeError(error)}`
+    });
+  } finally {
+    activeClaudeTurns.delete(sessionId);
+    if (!completed) {
+      await sendRelayEvent({
+        agent: claudeAgent,
+        type: "turn.completed",
+        threadId: sessionId,
+        turnId,
+        status: failed ? "error" : "completed"
+      });
+    }
+    await sendThreadUpsert({
+      agent: claudeAgent,
+      threadId: sessionId,
+      status: failed ? "error" : "completed",
+      cwd
+    });
+  }
+}
+
+async function listClaudeProjects(payload) {
+  const { listSessions } = await loadClaudeSdk();
+  const sessions = await listSessions({
+    limit: payload.limit || 100
+  });
+  const projectMap = new Map();
+
+  for (const session of sessions || []) {
+    const normalized = normalizeClaudeSession(session);
+    const cwd = normalized.cwd || workdir;
+    const project = projectMap.get(cwd) || {
+      cwd,
+      name: projectName(cwd),
+      count: 0,
+      latestAt: 0,
+      latestPreview: ""
+    };
+
+    project.count += 1;
+    if ((normalized.updatedAt || 0) > project.latestAt) {
+      project.latestAt = normalized.updatedAt || 0;
+      project.latestPreview = normalized.title || normalized.preview || "";
+    }
+    projectMap.set(cwd, project);
+  }
+
+  if (!projectMap.has(workdir)) {
+    projectMap.set(workdir, {
+      cwd: workdir,
+      name: projectName(workdir),
+      count: 0,
+      latestAt: 0,
+      latestPreview: "新建 Claude 会话"
+    });
+  }
+
+  return {
+    projects: Array.from(projectMap.values()).sort((a, b) => b.latestAt - a.latestAt),
+    nextCursor: null
+  };
+}
+
+async function listClaudeThreads(payload) {
+  const { listSessions } = await loadClaudeSdk();
+  const sessions = await listSessions({
+    dir: payload.cwd || undefined,
+    limit: payload.limit || 50
+  });
+
+  return {
+    threads: (sessions || []).map((session) => normalizeClaudeSession(session, payload.cwd)),
+    nextCursor: null,
+    backwardsCursor: null
+  };
+}
+
+async function readClaudeThread(payload) {
+  if (!payload.threadId) {
+    throw new Error("threadId is required");
+  }
+
+  const { getSessionInfo, getSessionMessages } = await loadClaudeSdk();
+  const [sessionInfo, messages] = await Promise.all([
+    getSessionInfo(payload.threadId, {
+      dir: payload.cwd || undefined
+    }).catch(() => null),
+    getSessionMessages(payload.threadId, {
+      dir: payload.cwd || undefined,
+      limit: payload.limit || 200
+    })
+  ]);
+
+  const thread = normalizeClaudeSession(
+    sessionInfo || { sessionId: payload.threadId, cwd: payload.cwd || workdir },
+    payload.cwd || workdir
+  );
+  const events = [];
+
+  for (const [index, message] of (messages || []).entries()) {
+    events.push(...claudeSessionMessageToEvents(message, thread.threadId, index));
+  }
+
+  return {
+    thread,
+    events: events.sort((a, b) => (a.at || 0) - (b.at || 0))
+  };
+}
+
+async function handleClaudeSdkMessage(message, context) {
+  const sessionId = message.session_id || message.sessionId || context.sessionId;
+  const turnId = message.uuid || message.id || context.turnId;
+  const at = Date.now();
+
+  if (message.type === "system" && message.subtype === "init") {
+    await sendThreadUpsert({
+      agent: claudeAgent,
+      threadId: sessionId,
+      status: "running",
+      cwd: message.cwd || context.cwd,
+      title: "Claude session",
+      preview: message.model ? `model: ${message.model}` : undefined
+    });
+    return false;
+  }
+
+  if (message.type === "assistant") {
+    const text = messageContentToText(message.message?.content);
+    if (text) {
+      await sendRelayEvent({
+        agent: claudeAgent,
+        type: "assistant.delta",
+        threadId: sessionId,
+        turnId,
+        itemId: message.uuid || randomUUID(),
+        text,
+        raw: message,
+        at
+      });
+    }
+    for (const event of claudeToolUseEvents(message, sessionId, turnId, at)) {
+      await sendRelayEvent(event);
+    }
+    return false;
+  }
+
+  if (message.type === "local_command_output") {
+    await sendRelayEvent({
+      agent: claudeAgent,
+      type: "command.output",
+      threadId: sessionId,
+      turnId,
+      itemId: message.uuid || randomUUID(),
+      output: message.output || stringifyClaude(message),
+      raw: message,
+      at
+    });
+    return false;
+  }
+
+  if (message.type === "result") {
+    const status = message.subtype === "error" ? "error" : "completed";
+    await sendRelayEvent({
+      agent: claudeAgent,
+      type: "turn.completed",
+      threadId: sessionId,
+      turnId,
+      status,
+      raw: message,
+      at
+    });
+    await sendThreadUpsert({
+      agent: claudeAgent,
+      threadId: sessionId,
+      status,
+      cwd: context.cwd,
+      preview: message.result || undefined
+    });
+    return true;
+  }
+
+  return false;
+}
+
+function createClaudeApprovalHandler({ sessionId, turnId, cwd }) {
+  return async function canUseTool(toolName, input, options = {}) {
+    const approvalId = `claude-${options.toolUseID || randomUUID()}`;
+    const title = `Claude 请求使用 ${toolName}`;
+    const command = toolName === "Bash"
+      ? input?.command || input?.cmd
+      : undefined;
+
+    await sendRelay({
+      type: "approval.request",
+      approval: {
+        agent: claudeAgent,
+        approvalId,
+        threadId: sessionId,
+        turnId,
+        kind: toolName || "tool",
+        title,
+        command,
+        cwd: input?.cwd || cwd,
+        reason: options?.permissionContext || options?.description,
+        raw: { toolName, input, options },
+        createdAt: Date.now()
+      }
+    });
+
+    return new Promise((resolve, reject) => {
+      pendingApprovals.set(approvalId, {
+        agent: claudeAgent,
+        resolve,
+        reject,
+        toolUseID: options.toolUseID
+      });
+
+      options.signal?.addEventListener("abort", () => {
+        pendingApprovals.delete(approvalId);
+        reject(new Error("Claude tool approval was aborted"));
+      }, { once: true });
+    });
+  };
+}
+
+function mapClaudeApprovalDecision(decision, toolUseID) {
+  if (decision === "accept" || decision === "acceptForSession") {
+    return {
+      behavior: "allow",
+      toolUseID
+    };
+  }
+
+  return {
+    behavior: "deny",
+    toolUseID,
+    message: decision === "cancel" ? "User cancelled from mobile companion" : "User declined from mobile companion"
+  };
+}
+
+async function loadClaudeSdk() {
+  if (!claudeSdkPromise) {
+    claudeSdkPromise = import("@anthropic-ai/claude-agent-sdk").catch((error) => {
+      claudeSdkPromise = null;
+      throw new Error(`Claude Agent SDK is not installed or failed to load: ${error.message}`);
+    });
+  }
+  return claudeSdkPromise;
+}
+
+function resolveClaudeCodeExecutable() {
+  const explicit = process.env.CLAUDE_CODE_EXECUTABLE
+    || process.env.CLAUDE_CODE_COMMAND
+    || process.env.CLAUDE_EXECUTABLE;
+  if (explicit) {
+    return resolveExecutableCandidate(explicit);
+  }
+
+  return findExecutableOnPath(process.platform === "win32" ? "claude.exe" : "claude")
+    || findExecutableOnPath("claude")
+    || commonClaudeExecutablePaths().find(isExecutableFile)
+    || null;
+}
+
+function resolveExecutableCandidate(candidate) {
+  if (candidate.includes("/") || candidate.includes("\\") || path.isAbsolute(candidate)) {
+    return isExecutableFile(candidate) ? candidate : candidate;
+  }
+  return findExecutableOnPath(candidate) || candidate;
+}
+
+function findExecutableOnPath(command) {
+  const pathEntries = (process.env.PATH || "").split(path.delimiter).filter(Boolean);
+  const extensions = process.platform === "win32"
+    ? (process.env.PATHEXT || ".EXE;.CMD;.BAT").split(";")
+    : [""];
+  const commands = path.extname(command)
+    ? [command]
+    : extensions.map((extension) => `${command}${extension.toLowerCase()}`);
+
+  for (const entry of pathEntries) {
+    for (const name of commands) {
+      const candidate = path.join(entry, name);
+      if (isExecutableFile(candidate)) return candidate;
+    }
+  }
+  return null;
+}
+
+function commonClaudeExecutablePaths() {
+  const home = os.homedir();
+  if (process.platform === "win32") {
+    const localAppData = process.env.LOCALAPPDATA || path.join(home, "AppData", "Local");
+    return [
+      path.join(localAppData, "Programs", "Claude", "claude.exe"),
+      path.join(home, ".local", "bin", "claude.exe")
+    ];
+  }
+
+  return [
+    path.join(home, ".local", "bin", "claude"),
+    "/opt/homebrew/bin/claude",
+    "/usr/local/bin/claude",
+    "/usr/bin/claude"
+  ];
+}
+
+function isExecutableFile(candidate) {
+  try {
+    fs.accessSync(candidate, fs.constants.X_OK);
+    return fs.statSync(candidate).isFile();
+  } catch {
+    return false;
+  }
+}
+
+function formatClaudeError(error) {
+  const message = error?.message || String(error);
+  if (message.includes("Native CLI binary") || message.includes("pathToClaudeCodeExecutable")) {
+    return `${message}\n\n已自动尝试从 PATH 查找 claude 命令。仍失败时，请执行 npm install --include=optional，或设置 CLAUDE_CODE_EXECUTABLE=/path/to/claude。`;
+  }
+  return message;
+}
+
 async function ensureThreadResumed(threadId) {
   if (!threadId || resumedThreads.has(threadId)) return;
 
@@ -429,6 +875,7 @@ function handleApprovalRequest(message) {
   sendRelay({
     type: "approval.request",
     approval: {
+      agent: codexAgent,
       approvalId,
       threadId,
       turnId,
@@ -453,6 +900,7 @@ function normalizeCodexEvent(method, params) {
   if (turnId) activeTurnId = turnId;
 
   const base = {
+    agent: codexAgent,
     type: mapEventType(method, params),
     method,
     threadId,
@@ -630,14 +1078,20 @@ function ensureCodexReady() {
 function sendThreadUpsert(thread) {
   return sendRelay({
     type: "thread.upsert",
-    thread
+    thread: {
+      ...thread,
+      agent: thread.agent || codexAgent
+    }
   });
 }
 
 function sendRelayEvent(event) {
   return sendRelay({
     type: "event",
-    event
+    event: {
+      ...event,
+      agent: event.agent || codexAgent
+    }
   });
 }
 
@@ -742,6 +1196,7 @@ function extractTurnId(value) {
 
 function normalizeThread(thread, fallbackThreadId) {
   return {
+    agent: codexAgent,
     threadId: fallbackThreadId || thread.id || thread.threadId,
     title: thread.name || thread.preview || "Codex thread",
     status: thread.status,
@@ -750,6 +1205,115 @@ function normalizeThread(thread, fallbackThreadId) {
     createdAt: thread.createdAt ? thread.createdAt * 1000 : undefined,
     updatedAt: thread.updatedAt ? thread.updatedAt * 1000 : undefined
   };
+}
+
+function normalizeClaudeSession(session, fallbackCwd = workdir) {
+  const threadId = session.sessionId || session.session_id || session.id;
+  const title = session.summary
+    || session.customTitle
+    || session.title
+    || session.firstPrompt
+    || "Claude session";
+  const updatedAt = toMs(session.lastModified || session.updatedAt || session.updated_at || session.modifiedAt);
+  const createdAt = toMs(session.createdAt || session.created_at);
+
+  return {
+    agent: claudeAgent,
+    threadId,
+    title,
+    status: session.status,
+    cwd: session.cwd || session.dir || fallbackCwd,
+    preview: session.preview || session.firstPrompt || title,
+    createdAt,
+    updatedAt: updatedAt || createdAt || Date.now()
+  };
+}
+
+function claudeSessionMessageToEvents(message, threadId, index) {
+  const sessionId = message.session_id || message.sessionId || threadId;
+  const turnId = message.uuid || message.id || `${sessionId}-${index}`;
+  const at = messageTime(message) || Date.now() + index;
+
+  if (message.type === "user") {
+    const text = messageContentToText(message.message?.content || message.content);
+    return text ? [{
+      agent: claudeAgent,
+      type: "user.message",
+      threadId: sessionId,
+      turnId,
+      itemId: message.uuid || turnId,
+      text,
+      raw: message,
+      at
+    }] : [];
+  }
+
+  if (message.type === "assistant") {
+    const events = [];
+    const text = messageContentToText(message.message?.content || message.content);
+    if (text) {
+      events.push({
+        agent: claudeAgent,
+        type: "assistant.delta",
+        threadId: sessionId,
+        turnId,
+        itemId: message.uuid || turnId,
+        text,
+        raw: message,
+        at
+      });
+    }
+    events.push(...claudeToolUseEvents(message, sessionId, turnId, at));
+    return events;
+  }
+
+  if (message.type === "result") {
+    return [{
+      agent: claudeAgent,
+      type: "turn.completed",
+      threadId: sessionId,
+      turnId,
+      status: message.subtype === "error" ? "error" : "completed",
+      raw: message,
+      at
+    }];
+  }
+
+  return [];
+}
+
+function claudeToolUseEvents(message, threadId, turnId, at) {
+  const content = message.message?.content || message.content || [];
+  if (!Array.isArray(content)) return [];
+
+  return content
+    .filter((block) => block?.type === "tool_use")
+    .map((block) => ({
+      agent: claudeAgent,
+      type: "tool.call",
+      threadId,
+      turnId,
+      itemId: block.id || `${turnId}-${block.name}`,
+      text: `${block.name || "tool"} ${block.input ? stringifyClaude(block.input) : ""}`.trim(),
+      raw: block,
+      at
+    }));
+}
+
+function messageContentToText(content) {
+  if (!content) return "";
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return stringifyClaude(content);
+
+  return content.map((block) => {
+    if (!block) return "";
+    if (typeof block === "string") return block;
+    if (block.type === "text") return block.text || "";
+    if (block.type === "tool_result") return messageContentToText(block.content);
+    if (block.type === "image") return "[image]";
+    if (block.type === "tool_use") return "";
+    return stringifyClaude(block);
+  }).filter(Boolean).join("\n");
 }
 
 function threadItemToEvents(item, threadId, turnId, turn) {
@@ -897,9 +1461,37 @@ function projectName(cwd) {
   return cwd.split(/[\\/]/).filter(Boolean).at(-1) || cwd;
 }
 
+function normalizeAgent(agent) {
+  return agent === claudeAgent ? claudeAgent : codexAgent;
+}
+
+function agentAdapterFor(agent) {
+  return agentAdapters[normalizeAgent(agent)] || agentAdapters[codexAgent];
+}
+
+function messageTime(message) {
+  return toMs(message.timestamp || message.createdAt || message.created_at || message.time);
+}
+
+function toMs(value) {
+  if (!value) return undefined;
+  if (typeof value === "number") return secondsToMs(value);
+  const parsed = Date.parse(value);
+  return Number.isNaN(parsed) ? undefined : parsed;
+}
+
 function secondsToMs(value) {
   if (!value) return Date.now();
   return value > 10_000_000_000 ? value : value * 1000;
+}
+
+function stringifyClaude(value) {
+  if (typeof value === "string") return value;
+  try {
+    return JSON.stringify(value, null, 2);
+  } catch {
+    return String(value);
+  }
 }
 
 function firstLine(text) {

@@ -1,0 +1,3 @@
+.companion-data/
+node_modules/
+*.log

@@ -1,6 +1,10 @@
 import { spawn } from "node:child_process";
+import { fileURLToPath } from "node:url";
+import path from "node:path";
 import os from "node:os";
+import { renderQr } from "./terminal-qr.mjs";
 
+const scriptRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const token = process.env.MOBILE_COMPANION_TOKEN || "dev-token";
 const host = process.env.HOST || "0.0.0.0";
 const port = process.env.PORT || "8787";
@@ -8,24 +12,28 @@ const codexListen = process.env.CODEX_LISTEN || "ws://127.0.0.1:7331";
 const relayUrl = process.env.RELAY_URL || `http://127.0.0.1:${port}`;
 const codexWsUrl = process.env.CODEX_WS_URL || codexListen;
 const shouldStartCodex = process.env.CODEX_START !== "0";
+const codexCommand = process.env.CODEX_COMMAND || "codex";
+const shouldPrintQr = process.env.START_QR !== "0";
 
 const children = [];
 let shuttingDown = false;
 
-start("relay", process.execPath, ["server/relay.mjs"], {
+start("relay", process.execPath, [path.join(scriptRoot, "server/relay.mjs")], {
   HOST: host,
   PORT: port,
   MOBILE_COMPANION_TOKEN: token
 });
 
 if (shouldStartCodex) {
-  start("codex", "codex", ["app-server", "--listen", codexListen], {});
+  start("codex", codexCommand, ["app-server", "--listen", codexListen], {}, {
+    shell: process.platform === "win32"
+  });
 } else {
   console.log(`Codex app-server start skipped; using ${codexWsUrl}`);
 }
 
 setTimeout(() => {
-  start("host", process.execPath, ["host/host-agent.mjs"], {
+  start("host", process.execPath, [path.join(scriptRoot, "host/host-agent.mjs")], {
     RELAY_URL: relayUrl,
     CODEX_WS_URL: codexWsUrl,
     MOBILE_COMPANION_TOKEN: token
@@ -42,14 +50,16 @@ process.on("exit", () => {
   }
 });
 
-function start(label, command, args, extraEnv) {
+function start(label, command, args, extraEnv, options = {}) {
   const child = spawn(command, args, {
     cwd: process.cwd(),
     env: {
       ...process.env,
       ...extraEnv
     },
-    stdio: ["ignore", "pipe", "pipe"]
+    stdio: ["ignore", "pipe", "pipe"],
+    shell: Boolean(options.shell),
+    windowsHide: true
   });
 
   children.push(child);
@@ -103,11 +113,26 @@ function shutdown(reason) {
 function printUrls() {
   const localUrl = `http://localhost:${port}/?token=${encodeURIComponent(token)}`;
   const lanUrls = getLanHosts().map((address) => `http://${address}:${port}/?token=${encodeURIComponent(token)}`);
+  const qrUrl = lanUrls[0] || localUrl;
 
   console.log("Codex Mobile Companion starting...");
   console.log(`Local: ${localUrl}`);
   for (const url of lanUrls) {
     console.log(`LAN:   ${url}`);
+  }
+  printQr(qrUrl);
+}
+
+function printQr(url) {
+  if (!shouldPrintQr) return;
+
+  try {
+    console.log("");
+    console.log("Scan on mobile:");
+    console.log(renderQr(url));
+    console.log(url);
+  } catch (error) {
+    console.log(`QR skipped: ${error.message}`);
   }
 }
 

@@ -1,9 +1,17 @@
 {
   "name": "Codex Mobile Companion",
-  "short_name": "Codex",
-  "start_url": "/",
+  "short_name": "Companion",
+  "start_url": "/?source=pwa",
+  "scope": "/",
   "display": "standalone",
   "background_color": "#f7f7f4",
   "theme_color": "#111827",
-  "icons": []
+  "icons": [
+    {
+      "src": "/icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ]
 }

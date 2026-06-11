@@ -6,6 +6,7 @@
     <meta name="theme-color" content="#111827">
     <title>Codex Mobile Companion</title>
     <link rel="manifest" href="/manifest.json">
+    <link rel="icon" href="/icon.svg" type="image/svg+xml">
     <link rel="stylesheet" href="/styles.css">
   </head>
   <body>
@@ -15,19 +16,46 @@
           <h1>Codex Companion</h1>
           <p id="statusLine">连接中</p>
         </div>
-        <button id="refreshButton" class="icon-button" title="刷新" aria-label="刷新">↻</button>
+        <div class="topbar-actions">
+          <select id="agentSelect" class="agent-select" aria-label="Agent">
+            <option value="codex">Codex</option>
+            <option value="claude">Claude</option>
+          </select>
+          <button id="notifyButton" class="icon-button text-button" title="开启通知" aria-label="开启通知">通知</button>
+          <button id="refreshButton" class="icon-button" title="刷新" aria-label="刷新">↻</button>
+        </div>
       </header>
 
       <section class="composer">
-        <textarea id="messageInput" rows="3" placeholder="发给 Codex 的消息"></textarea>
-        <button id="sendButton">发送</button>
+        <textarea id="messageInput" rows="3" placeholder="发给当前 Agent 的消息"></textarea>
+        <div class="composer-actions">
+          <button id="sendButton">发送</button>
+          <button id="broadcastButton" class="secondary-button">双发</button>
+          <button id="newThreadButton" class="secondary-button">新对话</button>
+        </div>
+      </section>
+
+      <section class="searchbar">
+        <input id="searchInput" type="search" placeholder="搜索项目、历史或当前消息">
+        <button id="clearSearchButton" class="secondary-button">清空</button>
+      </section>
+
+      <section class="thread-actions" aria-label="当前对话操作">
+        <button id="starThreadButton" class="secondary-button">☆</button>
+        <button id="renameThreadButton" class="secondary-button">重命名</button>
+        <button id="pinThreadButton" class="secondary-button">置顶</button>
+        <button id="archiveThreadButton" class="secondary-button">归档</button>
+        <button id="exportThreadButton" class="secondary-button">导出</button>
       </section>
 
       <nav class="tabs" aria-label="视图">
         <button class="tab active" data-view="projects">项目</button>
         <button class="tab" data-view="timeline">消息</button>
         <button class="tab" data-view="history">历史</button>
+        <button class="tab" data-view="search">搜索</button>
         <button class="tab" data-view="approvals">授权 <span id="approvalBadge">0</span></button>
+        <button class="tab" data-view="settings">设置</button>
+        <button class="tab" data-view="debug">调试</button>
       </nav>
 
       <section id="projectsView" class="view active">
@@ -42,8 +70,31 @@
         <div id="historyThreads" class="stack"></div>
       </section>
 
+      <section id="searchView" class="view">
+        <div class="search-panel">
+          <div class="search-panel-controls">
+            <input id="globalSearchInput" type="search" placeholder="全局搜索会话、消息、项目">
+            <select id="globalSearchAgent" class="agent-select" aria-label="搜索 Agent">
+              <option value="all">全部 Agent</option>
+              <option value="codex">Codex</option>
+              <option value="claude">Claude</option>
+            </select>
+            <button id="runGlobalSearchButton" class="secondary-button">搜索</button>
+          </div>
+          <div id="searchResults" class="stack"></div>
+        </div>
+      </section>
+
       <section id="approvalsView" class="view">
         <div id="approvals" class="stack"></div>
+      </section>
+
+      <section id="settingsView" class="view">
+        <div id="settings" class="stack"></div>
+      </section>
+
+      <section id="debugView" class="view">
+        <div id="debug" class="stack"></div>
       </section>
     </main>
 
